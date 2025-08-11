@@ -4,6 +4,7 @@ Clear separation: Engagement (chat) vs Full Workflow (info gathering + synthesis
 """
 import asyncio
 import json
+import logging
 import os
 import uuid
 import sys
@@ -16,7 +17,11 @@ src_dir = current_dir.parent
 sys.path.insert(0, str(src_dir))
 
 import streamlit as st
-from orchestrator.production_orchestrator import ProductionQBROrchestrator
+from orchestrator import ProductionQBROrchestrator
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class ProductionQBRStreamlitApp:
@@ -74,9 +79,29 @@ class ProductionQBRStreamlitApp:
         if 'completion_percentage' not in st.session_state:
             st.session_state.completion_percentage = 0.0
         
+        if 'frustration_index' not in st.session_state:
+            st.session_state.frustration_index = 0.0
+        
+        if 'json_completion_percentage' not in st.session_state:
+            st.session_state.json_completion_percentage = 0.0
+        
         # 🔧 FIX: Load existing conversation on app restart
         if len(st.session_state.messages) == 0:
             self._load_existing_conversation()
+            
+        # 🔧 FIX: Add initial greeting if no messages exist
+        if len(st.session_state.messages) == 0:
+            self._add_initial_greeting()
+    
+    def _add_initial_greeting(self):
+        """Add initial greeting from the engagement agent."""
+        initial_greeting = {
+            "role": "assistant",
+            "content": "Hello! I'm your QBR Engagement Agent. I'll help you create a comprehensive Quarterly Business Review. To get started, could you please tell me:\n\n1. What company or organization is this QBR for?\n2. What time period should we cover?\n3. What are the key business areas you'd like to focus on?\n\nFeel free to provide as much detail as you'd like!",
+            "timestamp": datetime.now().strftime("%H:%M:%S")
+        }
+        st.session_state.messages.append(initial_greeting)
+        logger.info("Added initial greeting message")
     
     def _load_existing_conversation(self):
         """Load existing conversation from orchestrator if available."""
@@ -147,11 +172,11 @@ class ProductionQBRStreamlitApp:
             # Real-time session status from orchestrator
             self._render_session_status()
             
+            # 🔧 FIX: Add JSON completion and frustration metrics
+            self._render_engagement_metrics()
+            
             # Phase explanation
             self._render_phase_explanation()
-            
-            # Example queries
-            self._render_example_queries()
             
             # Workflow controls
             self._render_workflow_controls()
@@ -207,6 +232,59 @@ class ProductionQBRStreamlitApp:
         except Exception as e:
             st.error(f"Status Error: {str(e)}")
     
+    def _render_engagement_metrics(self):
+        """Render JSON completion percentage and frustration index."""
+        st.subheader("📈 Engagement Metrics")
+        
+        try:
+            # Get metrics from engagement agent
+            if hasattr(self.orchestrator.engagement_agent, 'get_completion_percentage'):
+                completion_pct = self.orchestrator.engagement_agent.get_completion_percentage(st.session_state.session_id)
+                st.session_state.json_completion_percentage = completion_pct
+            
+            # Try to get frustration index if available
+            frustration = 0.0
+            if hasattr(self.orchestrator.engagement_agent, 'get_frustration_index'):
+                frustration = self.orchestrator.engagement_agent.get_frustration_index(st.session_state.session_id)
+                st.session_state.frustration_index = frustration
+            else:
+                # Calculate simple frustration based on message count without completion
+                message_count = len([m for m in st.session_state.messages if m["role"] == "user"])
+                if message_count > 3 and not st.session_state.engagement_complete:
+                    frustration = min((message_count - 3) * 10, 50)  # Max 50% frustration
+                st.session_state.frustration_index = frustration
+            
+            # Display metrics
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric(
+                    "JSON Completion %", 
+                    f"{st.session_state.json_completion_percentage:.1f}%",
+                    delta=None
+                )
+            
+            with col2:
+                # Color code frustration index
+                frustration_color = "🟢" if frustration < 20 else "🟡" if frustration < 40 else "🔴"
+                st.metric(
+                    f"{frustration_color} Frustration Index", 
+                    f"{st.session_state.frustration_index:.1f}%",
+                    delta=None
+                )
+            
+            # Progress bars
+            st.caption("JSON Completion Progress:")
+            st.progress(st.session_state.json_completion_percentage / 100.0)
+            
+            if st.session_state.frustration_index > 0:
+                st.caption("Frustration Level:")
+                st.progress(st.session_state.frustration_index / 100.0)
+            
+        except Exception as e:
+            logger.warning(f"Could not get engagement metrics: {e}")
+            st.warning("Metrics temporarily unavailable")
+    
     def _render_phase_explanation(self):
         """Explain when each agent is called."""
         st.subheader("🔄 Agent Execution Flow")
@@ -239,39 +317,6 @@ class ProductionQBRStreamlitApp:
                 st.caption(f"*What:* {phase['what']}")
                 st.divider()
     
-    def _render_example_queries(self):
-        """Render example queries for quick testing."""
-        st.subheader("📋 Example Queries")
-        st.caption("Click to auto-fill and test different scenarios")
-        
-        examples = [
-            {
-                "name": "TechCorp Q3 2025",
-                "icon": "🏢",
-                "query": "Generate a QBR for TechCorp Industries for Q3 2025. Focus on revenue growth, customer satisfaction, and operational efficiency. Include revenue, customer NPS, cost reduction, and market share metrics."
-            },
-            {
-                "name": "Financial Services",
-                "icon": "🏦", 
-                "query": "Create a quarterly business review for Wells Fargo Bank for Q4 2024. Focus on credit risk analysis for Bankcard products. Include delinquency rates, account balances, and year-over-year trends."
-            },
-            {
-                "name": "Retail Analysis",
-                "icon": "🛒",
-                "query": "I need a QBR for Walmart for Q2 2025. Focus on sales performance, inventory management, and customer satisfaction across different regions."
-            }
-        ]
-        
-        for example in examples:
-            if st.button(
-                f"{example['icon']} {example['name']}", 
-                key=f"example_{example['name']}", 
-                use_container_width=True,
-                disabled=st.session_state.workflow_running
-            ):
-                st.session_state.example_query = example['query']
-                st.rerun()
-    
     def _render_workflow_controls(self):
         """Render workflow control buttons."""
         st.subheader("🚀 Workflow Controls")
@@ -288,7 +333,14 @@ class ProductionQBRStreamlitApp:
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🗑️ Clear Chat", use_container_width=True, disabled=st.session_state.workflow_running):
+                # Clear messages but keep initial greeting
                 st.session_state.messages = []
+                self._add_initial_greeting()
+                st.session_state.engagement_complete = False
+                st.session_state.qbr_spec = None
+                st.session_state.completion_percentage = 0.0
+                st.session_state.json_completion_percentage = 0.0
+                st.session_state.frustration_index = 0.0
                 st.rerun()
         
         with col2:
@@ -306,7 +358,9 @@ class ProductionQBRStreamlitApp:
                 "Workflow Running": st.session_state.workflow_running,
                 "Workflow Complete": st.session_state.workflow_complete,
                 "Current Phase": st.session_state.current_phase,
-                "Completion %": st.session_state.completion_percentage
+                "Completion %": st.session_state.completion_percentage,
+                "JSON Completion %": st.session_state.json_completion_percentage,
+                "Frustration Index": st.session_state.frustration_index
             }
             st.json(debug_info)
     
@@ -326,21 +380,10 @@ class ProductionQBRStreamlitApp:
     
     def _handle_triggers(self):
         """Handle various UI triggers."""
-        # Example query trigger
-        if hasattr(st.session_state, 'example_query'):
-            st.session_state.user_input = st.session_state.example_query
-            del st.session_state.example_query
-        
         # Workflow trigger
         if hasattr(st.session_state, 'trigger_workflow'):
             self._start_full_workflow()
             del st.session_state.trigger_workflow
-        
-        # User input trigger
-        if hasattr(st.session_state, 'user_input'):
-            user_input = st.session_state.user_input
-            del st.session_state.user_input
-            self._process_engagement_message(user_input)
     
     def _render_chat_interface(self):
         """Render the chat interface for engagement agent."""
@@ -355,9 +398,10 @@ class ProductionQBRStreamlitApp:
                 if "timestamp" in message:
                     st.caption(f"🕒 {message['timestamp']}")
         
-        # Chat input
+        # Chat input - 🔧 FIX: Moved outside of any conditional or button logic
         if not st.session_state.workflow_running:
-            if prompt := st.chat_input("Describe your QBR requirements..."):
+            prompt = st.chat_input("Describe your QBR requirements...")
+            if prompt:
                 self._process_engagement_message(prompt)
         else:
             st.info("💡 Chat is disabled while workflow is running")
@@ -397,7 +441,7 @@ class ProductionQBRStreamlitApp:
         }
         st.session_state.messages.append(user_message)
         
-        # Show user message
+        # Show user message immediately
         with st.chat_message("user"):
             st.markdown(user_input)
         
@@ -426,13 +470,9 @@ class ProductionQBRStreamlitApp:
                         # Show engagement response
                         st.markdown(result.engagement_response)
                         
-                        # Add to messages
-                        assistant_message = {
-                            "role": "assistant",
-                            "content": result.engagement_response,
-                            "timestamp": datetime.now().strftime("%H:%M:%S")
-                        }
-                        st.session_state.messages.append(assistant_message)
+                        # Add to messages - 🔧 FIX: Don't duplicate, the orchestrator already adds it
+                        # Update session state directly from result
+                        st.session_state.messages = result.conversation_messages.copy()
                         
                         # Update session state
                         if result.is_engagement_complete:
@@ -452,6 +492,7 @@ class ProductionQBRStreamlitApp:
                         "timestamp": datetime.now().strftime("%H:%M:%S")
                     })
         
+        # 🔧 FIX: Use st.rerun() only at the end to prevent input box issues
         st.rerun()
     
     def _start_full_workflow(self):
@@ -591,9 +632,5 @@ def main():
     app = ProductionQBRStreamlitApp()
     app.run()
 
-
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger(__name__)
     main()
