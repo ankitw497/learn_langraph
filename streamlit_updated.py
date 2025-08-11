@@ -23,7 +23,10 @@ class ProductionQBRStreamlitApp:
     """Production Streamlit application with clear agent execution phases."""
     
     def __init__(self):
-        self.orchestrator = ProductionQBROrchestrator()
+        # 🔧 FIX: Use session state to maintain orchestrator instance
+        if 'orchestrator' not in st.session_state:
+            st.session_state.orchestrator = ProductionQBROrchestrator()
+        self.orchestrator = st.session_state.orchestrator
     
     def run(self):
         """Run the Streamlit application."""
@@ -45,6 +48,7 @@ class ProductionQBRStreamlitApp:
         """Initialize session state variables."""
         if 'session_id' not in st.session_state:
             st.session_state.session_id = str(uuid.uuid4())
+            logger.info(f"Created new session: {st.session_state.session_id}")
         
         if 'messages' not in st.session_state:
             st.session_state.messages = []
@@ -69,6 +73,30 @@ class ProductionQBRStreamlitApp:
         
         if 'completion_percentage' not in st.session_state:
             st.session_state.completion_percentage = 0.0
+        
+        # 🔧 FIX: Load existing conversation on app restart
+        if len(st.session_state.messages) == 0:
+            self._load_existing_conversation()
+    
+    def _load_existing_conversation(self):
+        """Load existing conversation from orchestrator if available."""
+        try:
+            status = self.orchestrator.get_session_status(st.session_state.session_id)
+            
+            if status.get("has_conversation", False):
+                # Load conversation messages from orchestrator
+                if hasattr(self.orchestrator, '_session_states') and st.session_state.session_id in self.orchestrator._session_states:
+                    state = self.orchestrator._session_states[st.session_state.session_id]
+                    st.session_state.messages = state.conversation_messages.copy()
+                    st.session_state.engagement_complete = state.is_engagement_complete
+                    st.session_state.qbr_spec = state.final_qbr_spec
+                    st.session_state.current_phase = state.current_phase
+                    st.session_state.completion_percentage = state.completion_percentage
+                    
+                    logger.info(f"Loaded {len(st.session_state.messages)} existing messages for session {st.session_state.session_id}")
+                
+        except Exception as e:
+            logger.warning(f"Could not load existing conversation: {e}")
     
     def _render_header(self):
         """Render the main header with phase indicators."""
@@ -362,11 +390,12 @@ class ProductionQBRStreamlitApp:
     def _process_engagement_message(self, user_input: str):
         """Process message through engagement agent only."""
         # Add user message to chat
-        st.session_state.messages.append({
+        user_message = {
             "role": "user",
             "content": user_input,
             "timestamp": datetime.now().strftime("%H:%M:%S")
-        })
+        }
+        st.session_state.messages.append(user_message)
         
         # Show user message
         with st.chat_message("user"):
@@ -398,11 +427,12 @@ class ProductionQBRStreamlitApp:
                         st.markdown(result.engagement_response)
                         
                         # Add to messages
-                        st.session_state.messages.append({
+                        assistant_message = {
                             "role": "assistant",
                             "content": result.engagement_response,
                             "timestamp": datetime.now().strftime("%H:%M:%S")
-                        })
+                        }
+                        st.session_state.messages.append(assistant_message)
                         
                         # Update session state
                         if result.is_engagement_complete:
@@ -546,9 +576,11 @@ class ProductionQBRStreamlitApp:
         except:
             pass  # Ignore cleanup errors
         
-        # Clear all session state
+        # Clear all session state except orchestrator
+        keys_to_keep = ['orchestrator']
         for key in list(st.session_state.keys()):
-            del st.session_state[key]
+            if key not in keys_to_keep:
+                del st.session_state[key]
         
         # Reinitialize
         self._initialize_session_state()
@@ -561,4 +593,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
     main()
