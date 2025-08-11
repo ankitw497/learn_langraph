@@ -1,517 +1,599 @@
 """
-Production LangGraph Orchestrator for Real QBR Agents.
-Orchestrates QBREngagementAgentSync -> Information Gatherer -> Synthesis Agent
+Production Streamlit UI for QBR Orchestrator with Real Agents.
+Clear separation: Engagement (chat) vs Full Workflow (info gathering + synthesis)
 """
 import asyncio
 import json
-import logging
 import os
-import sys
 import uuid
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
 
 # Add src to path
 current_dir = Path(__file__).parent
 src_dir = current_dir.parent
 sys.path.insert(0, str(src_dir))
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.state import CompiledStateGraph
-from pydantic import BaseModel, Field
-
-# Import your real agents
-try:
-    from engagement.agent import QBREngagementAgentSync
-    from setup_info_gatherer import run_information_gatherer
-    from synthesis.synthesis_agent import SynthesisAgentFactory
-except ImportError as e:
-    logging.warning(f"Could not import real agents: {e}. Using mock agents for testing.")
-    # Fallback to mock agents if real ones aren't available
-    class QBREngagementAgentSync:
-        def process_message(self, session_id, message):
-            return "Mock engagement response"
-        def is_complete(self, session_id):
-            return True
-        def get_final_spec(self, session_id):
-            return {"mock": "spec"}
-        def get_completion_percentage(self, session_id):
-            return 100.0
-    
-    def run_information_gatherer(spec):
-        return {"status": "mock_success"}
-    
-    class SynthesisAgentFactory:
-        @staticmethod
-        def create_test_agent(data_mode="local"):
-            class MockSynthesis:
-                def generate_presentation(self, spec, tables_manifest, mappings):
-                    return {
-                        "status": "success",
-                        "presentation_path": "./mock_presentation.pptx",
-                        "slides_count": 5,
-                        "insights_count": 3
-                    }
-            return MockSynthesis()
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import streamlit as st
+from orchestrator.production_orchestrator import ProductionQBROrchestrator
 
 
-class ProductionOrchestratorState(BaseModel):
-    """State object for production orchestrator."""
-    session_id: str
-    user_input: str = ""
-    conversation_messages: list = Field(default_factory=list)
-    
-    # Engagement phase
-    engagement_response: str = ""
-    is_engagement_complete: bool = False
-    final_qbr_spec: Optional[Dict[str, Any]] = None
-    
-    # Information gathering phase
-    info_gathering_complete: bool = False
-    enriched_data_path: Optional[str] = None
-    tables_manifest: Optional[list] = None
-    mappings: Optional[Dict[str, Any]] = None
-    
-    # Synthesis phase
-    synthesis_complete: bool = False
-    presentation_path: Optional[str] = None
-    presentation_result: Optional[Dict[str, Any]] = None
-    
-    # Status tracking
-    current_phase: str = "engagement"
-    error_message: Optional[str] = None
-    retry_count: int = 0
-    completion_percentage: float = 0.0
-    
-    class Config:
-        arbitrary_types_allowed = True
-
-
-class ProductionQBROrchestrator:
-    """Production orchestrator for real QBR agents with simplified execution."""
+class ProductionQBRStreamlitApp:
+    """Production Streamlit application with clear agent execution phases."""
     
     def __init__(self):
-        """Initialize the orchestrator with real agents."""
-        try:
-            self.engagement_agent = QBREngagementAgentSync()
-            logger.info("Real engagement agent initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize engagement agent: {e}")
-            raise
+        # 🔧 FIX: Use session state to maintain orchestrator instance
+        if 'orchestrator' not in st.session_state:
+            st.session_state.orchestrator = ProductionQBROrchestrator()
+        self.orchestrator = st.session_state.orchestrator
+    
+    def run(self):
+        """Run the Streamlit application."""
+        st.set_page_config(
+            page_title="QBR Orchestrator - Production",
+            page_icon="📊", 
+            layout="wide"
+        )
         
-        # Create data directories
-        self.data_dir = Path("./session_data")
-        self.data_dir.mkdir(exist_ok=True)
+        # Initialize session state
+        self._initialize_session_state()
         
-        # Simple conversation graph for engagement only
-        self.conversation_graph = self._build_conversation_graph()
+        # Render UI components
+        self._render_header()
+        self._render_sidebar()
+        self._render_main_content()
+    
+    def _initialize_session_state(self):
+        """Initialize session state variables."""
+        if 'session_id' not in st.session_state:
+            st.session_state.session_id = str(uuid.uuid4())
+            logger.info(f"Created new session: {st.session_state.session_id}")
         
-        logger.info("Production QBR Orchestrator initialized successfully")
-    
-    def _build_conversation_graph(self) -> CompiledStateGraph:
-        """Build a simple graph for engagement conversations only."""
-        workflow = StateGraph(ProductionOrchestratorState)
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
         
-        # Single node for engagement
-        workflow.add_node("engagement", self._engagement_node)
+        if 'engagement_complete' not in st.session_state:
+            st.session_state.engagement_complete = False
         
-        # Simple linear flow
-        workflow.add_edge(START, "engagement")
-        workflow.add_edge("engagement", END)
+        if 'workflow_running' not in st.session_state:
+            st.session_state.workflow_running = False
         
-        return workflow.compile()
+        if 'workflow_complete' not in st.session_state:
+            st.session_state.workflow_complete = False
+        
+        if 'qbr_spec' not in st.session_state:
+            st.session_state.qbr_spec = None
+        
+        if 'presentation_result' not in st.session_state:
+            st.session_state.presentation_result = None
+        
+        if 'current_phase' not in st.session_state:
+            st.session_state.current_phase = "engagement"
+        
+        if 'completion_percentage' not in st.session_state:
+            st.session_state.completion_percentage = 0.0
+        
+        # 🔧 FIX: Load existing conversation on app restart
+        if len(st.session_state.messages) == 0:
+            self._load_existing_conversation()
     
-    async def process_conversation_message(self, session_id: str, user_message: str) -> ProductionOrchestratorState:
-        """Process a single conversation message through the engagement agent."""
+    def _load_existing_conversation(self):
+        """Load existing conversation from orchestrator if available."""
         try:
-            logger.info(f"Processing message for session {session_id}")
+            status = self.orchestrator.get_session_status(st.session_state.session_id)
             
-            # Load conversation history
-            conversation_history = self._load_conversation_history(session_id)
-            
-            # Create state
-            state = ProductionOrchestratorState(
-                session_id=session_id,
-                user_input=user_message,
-                conversation_messages=conversation_history
-            )
-            
-            # Add user message to history
-            state.conversation_messages.append({
-                "role": "user",
-                "content": user_message,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Process through engagement graph
-            result = await self.conversation_graph.ainvoke(state)
-            
-            # Handle result format (LangGraph can return dict or state object)
-            if isinstance(result, dict):
-                final_state = ProductionOrchestratorState(**result)
-            else:
-                final_state = result
-            
-            # Save conversation history
-            self._save_conversation_history(session_id, final_state.conversation_messages)
-            
-            # Save state if engagement is complete
-            if final_state.is_engagement_complete:
-                self._save_engagement_state(session_id, final_state)
-                logger.info(f"Engagement complete for session {session_id}")
-            
-            return final_state
-            
-        except Exception as e:
-            logger.error(f"Error processing conversation message: {e}")
-            return ProductionOrchestratorState(
-                session_id=session_id,
-                user_input=user_message,
-                error_message=str(e),
-                current_phase="error"
-            )
-    
-    async def complete_qbr_workflow(self, session_id: str) -> ProductionOrchestratorState:
-        """Complete the full QBR workflow: Information Gathering + Synthesis."""
-        try:
-            logger.info(f"Starting complete QBR workflow for session {session_id}")
-            
-            # Load the completed engagement state
-            state = self._load_engagement_state(session_id)
-            if not state:
-                raise Exception("No completed engagement state found. Complete engagement first.")
-            
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available. Engagement may not be complete.")
-            
-            # Step 1: Information Gathering
-            logger.info("Executing information gathering phase...")
-            state.current_phase = "information_gathering"
-            state.completion_percentage = 33.0
-            
-            state = self._information_gathering_node(state)
-            
-            if state.error_message:
-                logger.error(f"Information gathering failed: {state.error_message}")
-                return state
-            
-            # Step 2: Synthesis
-            logger.info("Executing synthesis phase...")
-            state.current_phase = "synthesis"
-            state.completion_percentage = 66.0
-            
-            state = self._synthesis_node(state)
-            
-            if state.error_message:
-                logger.error(f"Synthesis failed: {state.error_message}")
-                return state
-            
-            # Complete
-            state.current_phase = "complete"
-            state.completion_percentage = 100.0
-            
-            # Save final state
-            self._save_final_state(session_id, state)
-            
-            logger.info(f"QBR workflow completed successfully for session {session_id}")
-            return state
-            
-        except Exception as e:
-            logger.error(f"Error completing QBR workflow: {e}")
-            return ProductionOrchestratorState(
-                session_id=session_id,
-                error_message=str(e),
-                current_phase="error",
-                completion_percentage=0.0
-            )
-    
-    def _engagement_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle engagement phase with the real engagement agent."""
-        try:
-            logger.info(f"Processing engagement for session {state.session_id}")
-            
-            # Process message with real engagement agent
-            response = self.engagement_agent.process_message(
-                state.session_id,
-                state.user_input
-            )
-            
-            # Update state
-            state.engagement_response = response
-            state.current_phase = "engagement"
-            
-            # Add response to conversation
-            state.conversation_messages.append({
-                "role": "assistant",
-                "content": response,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Check completion status
-            state.is_engagement_complete = self.engagement_agent.is_complete(state.session_id)
-            
-            if state.is_engagement_complete:
-                # Get final specification
-                state.final_qbr_spec = self.engagement_agent.get_final_spec(state.session_id)
-                state.completion_percentage = 33.0
-                logger.info(f"Engagement completed for session {state.session_id}")
-            else:
-                # Get completion percentage
-                try:
-                    pct = self.engagement_agent.get_completion_percentage(state.session_id)
-                    state.completion_percentage = min(pct * 0.33, 32.0)  # Cap at 32% until complete
-                except:
-                    state.completion_percentage = 10.0  # Default partial completion
-            
-            return state
-            
-        except Exception as e:
-            logger.error(f"Engagement node error: {e}")
-            state.error_message = str(e)
-            state.current_phase = "error"
-            return state
-    
-    def _information_gathering_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle information gathering with the real info gatherer."""
-        try:
-            logger.info(f"Starting information gathering for session {state.session_id}")
-            
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available for information gathering")
-            
-            # Create session-specific output directory
-            session_output_dir = self.data_dir / state.session_id / "info_gathering"
-            session_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Set environment variable for output location
-            original_qbr_out = os.environ.get("QBR_OUT")
-            os.environ["QBR_OUT"] = str(session_output_dir)
-            
-            try:
-                # Run the real information gatherer
-                result = run_information_gatherer(state.final_qbr_spec)
-                logger.info(f"Information gatherer result: {result}")
-                
-            finally:
-                # Restore original environment
-                if original_qbr_out:
-                    os.environ["QBR_OUT"] = original_qbr_out
-                elif "QBR_OUT" in os.environ:
-                    del os.environ["QBR_OUT"]
-            
-            # Update state
-            state.info_gathering_complete = True
-            state.enriched_data_path = str(session_output_dir)
-            
-            # Load generated files if they exist
-            spec_file = session_output_dir / "spec.json"
-            manifest_file = session_output_dir / "tables_manifest.json"
-            mappings_file = session_output_dir / "mappings.json"
-            
-            if spec_file.exists():
-                with open(spec_file, 'r') as f:
-                    enriched_spec = json.load(f)
-                    # Update with enriched spec
-                    state.final_qbr_spec.update(enriched_spec)
-                    logger.info("Loaded enriched specification")
-            
-            if manifest_file.exists():
-                with open(manifest_file, 'r') as f:
-                    state.tables_manifest = json.load(f)
-                    logger.info(f"Loaded tables manifest with {len(state.tables_manifest)} tables")
-            
-            if mappings_file.exists():
-                with open(mappings_file, 'r') as f:
-                    state.mappings = json.load(f)
-                    logger.info(f"Loaded mappings with {len(state.mappings)} entries")
-            
-            logger.info(f"Information gathering completed for session {state.session_id}")
-            return state
-            
-        except Exception as e:
-            logger.error(f"Information gathering error: {e}")
-            state.error_message = str(e)
-            state.current_phase = "error"
-            return state
-    
-    def _synthesis_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle synthesis with the real synthesis agent."""
-        try:
-            logger.info(f"Starting synthesis for session {state.session_id}")
-            
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available for synthesis")
-            
-            # Create synthesis agent
-            synthesis_agent = SynthesisAgentFactory.create_test_agent(data_mode="local")
-            
-            # Prepare parameters
-            spec = state.final_qbr_spec
-            tables_manifest = state.tables_manifest or []
-            mappings = state.mappings or {}
-            
-            logger.info(f"Generating presentation with {len(tables_manifest)} tables and {len(mappings)} mappings")
-            
-            # Generate presentation
-            result = synthesis_agent.generate_presentation(
-                spec=spec,
-                tables_manifest=tables_manifest,
-                mappings=mappings
-            )
-            
-            # Update state
-            state.presentation_result = result
-            state.synthesis_complete = True
-            
-            if result.get('status') == 'success':
-                state.presentation_path = result.get('presentation_path')
-                logger.info(f"Synthesis completed successfully. Presentation: {state.presentation_path}")
-            else:
-                error_msg = result.get('error', 'Unknown synthesis error')
-                logger.error(f"Synthesis failed: {error_msg}")
-                raise Exception(error_msg)
-            
-            return state
-            
-        except Exception as e:
-            logger.error(f"Synthesis error: {e}")
-            state.error_message = str(e)
-            state.current_phase = "error"
-            return state
-    
-    # Helper methods for state management
-    def _load_conversation_history(self, session_id: str) -> list:
-        """Load conversation history from disk."""
-        try:
-            history_file = self.data_dir / f"{session_id}_conversation.json"
-            if history_file.exists():
-                with open(history_file, 'r') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load conversation history: {e}")
-        return []
-    
-    def _save_conversation_history(self, session_id: str, messages: list):
-        """Save conversation history to disk."""
-        try:
-            history_file = self.data_dir / f"{session_id}_conversation.json"
-            with open(history_file, 'w') as f:
-                json.dump(messages, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save conversation history: {e}")
-    
-    def _load_engagement_state(self, session_id: str) -> Optional[ProductionOrchestratorState]:
-        """Load completed engagement state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_engagement_state.json"
-            if state_file.exists():
-                with open(state_file, 'r') as f:
-                    state_data = json.load(f)
-                return ProductionOrchestratorState(**state_data)
-        except Exception as e:
-            logger.error(f"Could not load engagement state: {e}")
-        return None
-    
-    def _save_engagement_state(self, session_id: str, state: ProductionOrchestratorState):
-        """Save completed engagement state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_engagement_state.json"
-            with open(state_file, 'w') as f:
-                json.dump(state.dict(), f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save engagement state: {e}")
-    
-    def _save_final_state(self, session_id: str, state: ProductionOrchestratorState):
-        """Save final workflow state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_final_state.json"
-            with open(state_file, 'w') as f:
-                json.dump(state.dict(), f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save final state: {e}")
-    
-    def get_session_status(self, session_id: str) -> Dict[str, Any]:
-        """Get comprehensive session status."""
-        try:
-            status = {
-                "session_id": session_id,
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            # Check conversation history
-            history = self._load_conversation_history(session_id)
-            status["message_count"] = len(history)
-            status["has_conversation"] = len(history) > 0
-            
-            # Check engagement status
-            try:
-                is_complete = self.engagement_agent.is_complete(session_id)
-                completion_pct = self.engagement_agent.get_completion_percentage(session_id)
-                
-                status["engagement"] = {
-                    "is_complete": is_complete,
-                    "completion_percentage": completion_pct
-                }
-                
-                if is_complete:
-                    spec = self.engagement_agent.get_final_spec(session_id)
-                    status["engagement"]["has_spec"] = spec is not None
-                    status["can_proceed_to_workflow"] = True
-                else:
-                    status["can_proceed_to_workflow"] = False
+            if status.get("has_conversation", False):
+                # Load conversation messages from orchestrator
+                if hasattr(self.orchestrator, '_session_states') and st.session_state.session_id in self.orchestrator._session_states:
+                    state = self.orchestrator._session_states[st.session_state.session_id]
+                    st.session_state.messages = state.conversation_messages.copy()
+                    st.session_state.engagement_complete = state.is_engagement_complete
+                    st.session_state.qbr_spec = state.final_qbr_spec
+                    st.session_state.current_phase = state.current_phase
+                    st.session_state.completion_percentage = state.completion_percentage
                     
-            except Exception as e:
-                status["engagement"] = {"error": str(e)}
-                status["can_proceed_to_workflow"] = False
-            
-            # Check workflow completion
-            final_state = self._load_engagement_state(session_id)
-            if final_state:
-                status["workflow"] = {
-                    "current_phase": final_state.current_phase,
-                    "completion_percentage": final_state.completion_percentage,
-                    "info_gathering_complete": final_state.info_gathering_complete,
-                    "synthesis_complete": final_state.synthesis_complete,
-                    "has_presentation": final_state.presentation_path is not None
-                }
-            
-            return status
-            
+                    logger.info(f"Loaded {len(st.session_state.messages)} existing messages for session {st.session_state.session_id}")
+                
         except Exception as e:
-            logger.error(f"Error getting session status: {e}")
-            return {
-                "session_id": session_id,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
+            logger.warning(f"Could not load existing conversation: {e}")
     
-    def cleanup_session(self, session_id: str):
-        """Clean up session data."""
+    def _render_header(self):
+        """Render the main header with phase indicators."""
+        st.title("📊 QBR Orchestrator - Production")
+        st.caption("Real AI Agents: Engagement Agent (Chat) → Information Gatherer → Synthesis Agent")
+        
+        # Phase indicators
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Session ID", st.session_state.session_id[-8:])
+        
+        with col2:
+            # Phase indicator with clear status
+            phase_status = self._get_phase_status()
+            st.metric("Current Phase", phase_status["display"])
+        
+        with col3:
+            # Progress percentage
+            progress = st.session_state.completion_percentage
+            st.metric("Progress", f"{progress:.0f}%")
+        
+        with col4:
+            if st.button("🔄 New Session"):
+                self._reset_session()
+                st.rerun()
+        
+        # Progress bar
+        if progress > 0:
+            st.progress(progress / 100.0)
+    
+    def _get_phase_status(self):
+        """Get current phase status with emoji and description."""
+        if st.session_state.workflow_complete:
+            return {"display": "✅ Complete", "description": "QBR presentation ready for download"}
+        elif st.session_state.workflow_running:
+            return {"display": "⚙️ Workflow Running", "description": "Generating QBR presentation"}
+        elif st.session_state.engagement_complete:
+            return {"display": "💬 Engagement Done", "description": "Ready to start full workflow"}
+        else:
+            return {"display": "💬 Chatting", "description": "Gathering QBR requirements"}
+    
+    def _render_sidebar(self):
+        """Render sidebar with controls, status, and examples."""
+        with st.sidebar:
+            st.header("🎛️ Control Panel")
+            
+            # Real-time session status from orchestrator
+            self._render_session_status()
+            
+            # Phase explanation
+            self._render_phase_explanation()
+            
+            # Example queries
+            self._render_example_queries()
+            
+            # Workflow controls
+            self._render_workflow_controls()
+            
+            # Debug information
+            self._render_debug_info()
+    
+    def _render_session_status(self):
+        """Render real-time session status."""
+        st.subheader("📊 Live Session Status")
+        
         try:
-            # Remove session files
-            files_to_remove = [
-                f"{session_id}_conversation.json",
-                f"{session_id}_engagement_state.json", 
-                f"{session_id}_final_state.json"
-            ]
+            status = self.orchestrator.get_session_status(st.session_state.session_id)
             
-            for filename in files_to_remove:
-                file_path = self.data_dir / filename
-                if file_path.exists():
-                    file_path.unlink()
+            # Engagement status
+            if 'engagement' in status:
+                eng_status = status['engagement']
+                if 'error' in eng_status:
+                    st.error(f"Engagement Error: {eng_status['error']}")
+                else:
+                    is_complete = eng_status.get('is_complete', False)
+                    completion_pct = eng_status.get('completion_percentage', 0)
+                    
+                    if is_complete:
+                        st.success("✅ Engagement Complete")
+                        st.session_state.engagement_complete = True
+                        st.session_state.completion_percentage = 33.0
+                    else:
+                        st.info(f"💬 Engagement: {completion_pct:.1f}%")
+                        st.session_state.completion_percentage = completion_pct * 0.33
             
-            # Remove session directory
-            session_dir = self.data_dir / session_id
-            if session_dir.exists():
-                import shutil
-                shutil.rmtree(session_dir)
+            # Workflow status
+            if 'workflow' in status:
+                wf_status = status['workflow']
+                current_phase = wf_status.get('current_phase', 'engagement')
+                st.session_state.current_phase = current_phase
+                
+                if wf_status.get('has_presentation'):
+                    st.success("🎉 Presentation Ready!")
+                    st.session_state.workflow_complete = True
+                    st.session_state.completion_percentage = 100.0
+                elif wf_status.get('synthesis_complete'):
+                    st.info("📝 Synthesis Complete")
+                    st.session_state.completion_percentage = 90.0
+                elif wf_status.get('info_gathering_complete'):
+                    st.info("📊 Information Gathering Complete")
+                    st.session_state.completion_percentage = 66.0
             
-            logger.info(f"Cleaned up session {session_id}")
-            
+            # Show status details
+            with st.expander("📋 Detailed Status"):
+                st.json(status)
+                
         except Exception as e:
-            logger.error(f"Error cleaning up session {session_id}: {e}")
+            st.error(f"Status Error: {str(e)}")
+    
+    def _render_phase_explanation(self):
+        """Explain when each agent is called."""
+        st.subheader("🔄 Agent Execution Flow")
+        
+        phases = [
+            {
+                "name": "💬 Engagement Agent",
+                "when": "Every chat message",
+                "what": "Understands requirements, asks clarifying questions",
+                "status": "✅" if st.session_state.engagement_complete else "🔄" if st.session_state.completion_percentage > 0 else "⏳"
+            },
+            {
+                "name": "📊 Information Gatherer", 
+                "when": "After engagement completion",
+                "what": "Enriches data, generates tables and mappings",
+                "status": "✅" if st.session_state.completion_percentage >= 66 else "⏳"
+            },
+            {
+                "name": "📝 Synthesis Agent",
+                "when": "After information gathering", 
+                "what": "Creates PowerPoint presentation",
+                "status": "✅" if st.session_state.workflow_complete else "⏳"
+            }
+        ]
+        
+        for phase in phases:
+            with st.container():
+                st.write(f"{phase['status']} **{phase['name']}**")
+                st.caption(f"*When:* {phase['when']}")
+                st.caption(f"*What:* {phase['what']}")
+                st.divider()
+    
+    def _render_example_queries(self):
+        """Render example queries for quick testing."""
+        st.subheader("📋 Example Queries")
+        st.caption("Click to auto-fill and test different scenarios")
+        
+        examples = [
+            {
+                "name": "TechCorp Q3 2025",
+                "icon": "🏢",
+                "query": "Generate a QBR for TechCorp Industries for Q3 2025. Focus on revenue growth, customer satisfaction, and operational efficiency. Include revenue, customer NPS, cost reduction, and market share metrics."
+            },
+            {
+                "name": "Financial Services",
+                "icon": "🏦", 
+                "query": "Create a quarterly business review for Wells Fargo Bank for Q4 2024. Focus on credit risk analysis for Bankcard products. Include delinquency rates, account balances, and year-over-year trends."
+            },
+            {
+                "name": "Retail Analysis",
+                "icon": "🛒",
+                "query": "I need a QBR for Walmart for Q2 2025. Focus on sales performance, inventory management, and customer satisfaction across different regions."
+            }
+        ]
+        
+        for example in examples:
+            if st.button(
+                f"{example['icon']} {example['name']}", 
+                key=f"example_{example['name']}", 
+                use_container_width=True,
+                disabled=st.session_state.workflow_running
+            ):
+                st.session_state.example_query = example['query']
+                st.rerun()
+    
+    def _render_workflow_controls(self):
+        """Render workflow control buttons."""
+        st.subheader("🚀 Workflow Controls")
+        
+        # Start full workflow button
+        if st.session_state.engagement_complete and not st.session_state.workflow_running and not st.session_state.workflow_complete:
+            if st.button("▶️ Start Full QBR Workflow", type="primary", use_container_width=True):
+                st.session_state.trigger_workflow = True
+                st.rerun()
+            
+            st.info("💡 This will run Information Gatherer + Synthesis Agent")
+        
+        # Reset buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Clear Chat", use_container_width=True, disabled=st.session_state.workflow_running):
+                st.session_state.messages = []
+                st.rerun()
+        
+        with col2:
+            if st.button("🔄 Reset All", use_container_width=True, disabled=st.session_state.workflow_running):
+                self._reset_session()
+                st.rerun()
+    
+    def _render_debug_info(self):
+        """Render debug information."""
+        with st.expander("🔍 Debug Info"):
+            debug_info = {
+                "Session ID": st.session_state.session_id,
+                "Messages": len(st.session_state.messages),
+                "Engagement Complete": st.session_state.engagement_complete,
+                "Workflow Running": st.session_state.workflow_running,
+                "Workflow Complete": st.session_state.workflow_complete,
+                "Current Phase": st.session_state.current_phase,
+                "Completion %": st.session_state.completion_percentage
+            }
+            st.json(debug_info)
+    
+    def _render_main_content(self):
+        """Render main content area."""
+        # Handle triggers
+        self._handle_triggers()
+        
+        # Main content tabs
+        tab1, tab2 = st.tabs(["💬 Chat with Engagement Agent", "📊 QBR Results"])
+        
+        with tab1:
+            self._render_chat_interface()
+        
+        with tab2:
+            self._render_results_tab()
+    
+    def _handle_triggers(self):
+        """Handle various UI triggers."""
+        # Example query trigger
+        if hasattr(st.session_state, 'example_query'):
+            st.session_state.user_input = st.session_state.example_query
+            del st.session_state.example_query
+        
+        # Workflow trigger
+        if hasattr(st.session_state, 'trigger_workflow'):
+            self._start_full_workflow()
+            del st.session_state.trigger_workflow
+        
+        # User input trigger
+        if hasattr(st.session_state, 'user_input'):
+            user_input = st.session_state.user_input
+            del st.session_state.user_input
+            self._process_engagement_message(user_input)
+    
+    def _render_chat_interface(self):
+        """Render the chat interface for engagement agent."""
+        st.subheader("💬 Engagement Agent Chat")
+        st.caption("The engagement agent will ask questions to understand your QBR requirements")
+        
+        # Display chat messages
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                
+                if "timestamp" in message:
+                    st.caption(f"🕒 {message['timestamp']}")
+        
+        # Chat input
+        if not st.session_state.workflow_running:
+            if prompt := st.chat_input("Describe your QBR requirements..."):
+                self._process_engagement_message(prompt)
+        else:
+            st.info("💡 Chat is disabled while workflow is running")
+        
+        # Show engagement completion status
+        if st.session_state.engagement_complete:
+            st.success("✅ **Engagement Complete!** Ready to generate your QBR presentation.")
+            
+            if st.session_state.qbr_spec:
+                with st.expander("📋 Final QBR Specification"):
+                    st.json(st.session_state.qbr_spec)
+    
+    def _render_results_tab(self):
+        """Render the results tab."""
+        if not st.session_state.engagement_complete:
+            st.info("💡 Complete the engagement chat first to see results here.")
+            return
+        
+        if st.session_state.workflow_running:
+            st.info("⚙️ Workflow is running... Results will appear here when complete.")
+            return
+        
+        if not st.session_state.workflow_complete:
+            st.warning("🚀 Click 'Start Full QBR Workflow' in the sidebar to generate your presentation.")
+            return
+        
+        # Show results
+        self._render_final_results()
+    
+    def _process_engagement_message(self, user_input: str):
+        """Process message through engagement agent only."""
+        # Add user message to chat
+        user_message = {
+            "role": "user",
+            "content": user_input,
+            "timestamp": datetime.now().strftime("%H:%M:%S")
+        }
+        st.session_state.messages.append(user_message)
+        
+        # Show user message
+        with st.chat_message("user"):
+            st.markdown(user_input)
+        
+        # Process through engagement agent
+        with st.chat_message("assistant"):
+            with st.spinner("🤔 Engagement agent is thinking..."):
+                try:
+                    # 🎯 ENGAGEMENT AGENT CALLED HERE - for every chat message
+                    result = asyncio.run(
+                        self.orchestrator.process_conversation_message(
+                            st.session_state.session_id,
+                            user_input
+                        )
+                    )
+                    
+                    # Display response
+                    if result.error_message:
+                        error_msg = f"❌ Error: {result.error_message}"
+                        st.error(error_msg)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": error_msg,
+                            "timestamp": datetime.now().strftime("%H:%M:%S")
+                        })
+                    else:
+                        # Show engagement response
+                        st.markdown(result.engagement_response)
+                        
+                        # Add to messages
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": result.engagement_response,
+                            "timestamp": datetime.now().strftime("%H:%M:%S")
+                        }
+                        st.session_state.messages.append(assistant_message)
+                        
+                        # Update session state
+                        if result.is_engagement_complete:
+                            st.session_state.engagement_complete = True
+                            st.session_state.qbr_spec = result.final_qbr_spec
+                            st.session_state.completion_percentage = 33.0
+                            
+                            # Show completion message
+                            st.success("🎉 Engagement complete! Ready for full workflow.")
+                
+                except Exception as e:
+                    error_msg = f"❌ Error processing message: {str(e)}"
+                    st.error(error_msg)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": error_msg,
+                        "timestamp": datetime.now().strftime("%H:%M:%S")
+                    })
+        
+        st.rerun()
+    
+    def _start_full_workflow(self):
+        """Start the full QBR workflow (Information Gatherer + Synthesis)."""
+        st.session_state.workflow_running = True
+        
+        # Create workflow status container
+        with st.container():
+            st.info("🚀 Starting full QBR workflow...")
+            progress_bar = st.progress(0.33)  # Start at 33% (engagement done)
+            status_text = st.empty()
+            
+            try:
+                # Update status
+                status_text.text("📊 Step 2/3: Information Gatherer is analyzing data...")
+                progress_bar.progress(0.5)
+                
+                # Update status  
+                status_text.text("📝 Step 3/3: Synthesis Agent is creating presentation...")
+                progress_bar.progress(0.8)
+                
+                # 🎯 INFORMATION GATHERER + SYNTHESIS AGENTS CALLED HERE
+                result = asyncio.run(
+                    self.orchestrator.complete_qbr_workflow(st.session_state.session_id)
+                )
+                
+                # Handle result
+                if result.error_message:
+                    st.error(f"❌ Workflow failed: {result.error_message}")
+                    status_text.text("❌ Workflow failed")
+                    progress_bar.progress(0.33)
+                else:
+                    # Success
+                    progress_bar.progress(1.0)
+                    status_text.text("✅ QBR presentation complete!")
+                    
+                    st.session_state.workflow_complete = True
+                    st.session_state.presentation_result = result.presentation_result
+                    st.session_state.completion_percentage = 100.0
+                    
+                    st.success("🎉 QBR Generation Complete!")
+                    st.balloons()
+                
+            except Exception as e:
+                st.error(f"❌ Workflow error: {str(e)}")
+                status_text.text("❌ Workflow error")
+                progress_bar.progress(0.33)
+            
+            finally:
+                st.session_state.workflow_running = False
+        
+        st.rerun()
+    
+    def _render_final_results(self):
+        """Render final results with download options."""
+        st.subheader("🎉 QBR Presentation Ready!")
+        
+        result = st.session_state.presentation_result
+        
+        if result and result.get('status') == 'success':
+            # Results summary
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("📊 Slides Created", result.get('slides_count', 0))
+            
+            with col2:
+                st.metric("💡 Insights Found", result.get('insights_count', 0))
+            
+            with col3:
+                if result.get('qa_results'):
+                    qa_status = result['qa_results'].get('overall_status', 'Unknown')
+                    st.metric("✅ Quality Status", qa_status)
+            
+            # Download section
+            st.divider()
+            presentation_path = result.get('presentation_path')
+            
+            if presentation_path and os.path.exists(presentation_path):
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.subheader("📥 Download Your QBR")
+                    st.write("Your PowerPoint presentation is ready for download.")
+                
+                with col2:
+                    # Download button
+                    with open(presentation_path, 'rb') as f:
+                        file_data = f.read()
+                    
+                    filename = f"QBR_{st.session_state.session_id[:8]}.pptx"
+                    
+                    st.download_button(
+                        label="📊 Download PowerPoint",
+                        data=file_data,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        type="primary",
+                        use_container_width=True
+                    )
+            
+            # Quality assurance results
+            if result.get('qa_results'):
+                with st.expander("🔍 Quality Assurance Results"):
+                    st.json(result['qa_results'])
+            
+            # Show QBR specification used
+            if st.session_state.qbr_spec:
+                with st.expander("📋 QBR Specification Used"):
+                    st.json(st.session_state.qbr_spec)
+        
+        else:
+            st.error("❌ Presentation generation failed")
+            if result and result.get('error'):
+                st.text(f"Error: {result['error']}")
+    
+    def _reset_session(self):
+        """Reset the session and start fresh."""
+        # Clean up current session
+        try:
+            self.orchestrator.cleanup_session(st.session_state.session_id)
+        except:
+            pass  # Ignore cleanup errors
+        
+        # Clear all session state except orchestrator
+        keys_to_keep = ['orchestrator']
+        for key in list(st.session_state.keys()):
+            if key not in keys_to_keep:
+                del st.session_state[key]
+        
+        # Reinitialize
+        self._initialize_session_state()
+
+
+def main():
+    """Main entry point for the Streamlit app."""
+    app = ProductionQBRStreamlitApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    main()
