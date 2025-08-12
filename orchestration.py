@@ -1,11 +1,12 @@
 """
-Production LangGraph Orchestrator for Real QBR Agents.
-Orchestrates QBREngagementAgentSync -> Information Gatherer -> Synthesis Agent
+Simplified File-Based Orchestrator for QBR Agents.
+Works with file system: engagement_output -> infoagent_output -> synthesis_output
 """
 import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from datetime import datetime
@@ -17,18 +18,17 @@ current_dir = Path(__file__).parent
 src_dir = current_dir.parent
 sys.path.insert(0, str(src_dir))
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel, Field
 
 # Import your real agents
 try:
     from engagement.agent import QBREngagementAgentSync
-    from setup_info_gatherer import run_information_gatherer
+    from setput_info_gatherer import run_information_gatherer, CONFIG as INFO_GATHERER_CONFIG
     from synthesis.synthesis_agent import SynthesisAgentFactory
 except ImportError as e:
-    logging.warning(f"Could not import real agents: {e}. Using mock agents for testing.")
-    # Fallback to mock agents if real ones aren't available
+    logging.warning(f"Could not import real agents: {e}. Using mock mode.")
+    
+    # Mock agents for testing
     class QBREngagementAgentSync:
         def __init__(self):
             self.sessions = {}
@@ -39,8 +39,8 @@ except ImportError as e:
             self.sessions[session_id]["messages"].append(message)
             if len(self.sessions[session_id]["messages"]) >= 3:
                 self.sessions[session_id]["complete"] = True
-                return "Mock engagement complete! I have all the information I need."
-            return f"Mock engagement response {len(self.sessions[session_id]['messages'])}"
+                return {"reply": "Mock engagement complete!", "spec_complete": True}
+            return {"reply": f"Mock response {len(self.sessions[session_id]['messages'])}"}
             
         def is_complete(self, session_id):
             return self.sessions.get(session_id, {}).get("complete", False)
@@ -51,15 +51,20 @@ except ImportError as e:
         def get_completion_percentage(self, session_id):
             msg_count = len(self.sessions.get(session_id, {}).get("messages", []))
             return min(msg_count * 33.33, 100.0)
+            
+        def get_frustration_index(self, session_id):
+            return 0.0
     
-    def run_information_gatherer(spec):
-        return {"status": "mock_success"}
+    def run_information_gatherer(config):
+        return [{"status": "mock_success", "filename": "mock_file.json"}]
+    
+    INFO_GATHERER_CONFIG = {"OUTPUT_DIR": "infoagent_output"}
     
     class SynthesisAgentFactory:
         @staticmethod
         def create_test_agent(data_mode="local"):
             class MockSynthesis:
-                def generate_presentation(self, spec, tables_manifest, mappings):
+                def generate_presentation(self, spec, tables_manifest=None, mappings=None):
                     return {
                         "status": "success",
                         "presentation_path": "./mock_presentation.pptx",
@@ -73,8 +78,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class ProductionOrchestratorState(BaseModel):
-    """State object for production orchestrator."""
+class FileBasedOrchestratorState(BaseModel):
+    """State object for file-based orchestrator."""
     session_id: str
     user_input: str = ""
     conversation_messages: list = Field(default_factory=list)
@@ -83,33 +88,34 @@ class ProductionOrchestratorState(BaseModel):
     engagement_response: str = ""
     is_engagement_complete: bool = False
     final_qbr_spec: Optional[Dict[str, Any]] = None
+    engagement_output_files: list = Field(default_factory=list)
     
     # Information gathering phase
     info_gathering_complete: bool = False
-    enriched_data_path: Optional[str] = None
-    tables_manifest: Optional[list] = None
-    mappings: Optional[Dict[str, Any]] = None
+    info_gatherer_output_files: list = Field(default_factory=list)
     
     # Synthesis phase
     synthesis_complete: bool = False
-    presentation_path: Optional[str] = None
+    synthesis_output_files: list = Field(default_factory=list)
     presentation_result: Optional[Dict[str, Any]] = None
     
     # Status tracking
     current_phase: str = "engagement"
     error_message: Optional[str] = None
-    retry_count: int = 0
     completion_percentage: float = 0.0
+    
+    # File tracking
+    session_folder: Optional[str] = None
     
     class Config:
         arbitrary_types_allowed = True
 
 
-class ProductionQBROrchestrator:
-    """Production orchestrator for real QBR agents with proper session management."""
+class FileBasedQBROrchestrator:
+    """File-based orchestrator that works with existing folder structure."""
     
     def __init__(self):
-        """Initialize the orchestrator with real agents."""
+        """Initialize the orchestrator with real agents and folder structure."""
         try:
             self.engagement_agent = QBREngagementAgentSync()
             logger.info("Real engagement agent initialized")
@@ -117,393 +123,289 @@ class ProductionQBROrchestrator:
             logger.error(f"Failed to initialize engagement agent: {e}")
             raise
         
-        # Create data directories
-        self.data_dir = Path("./session_data")
-        self.data_dir.mkdir(exist_ok=True)
+        # Define folder paths (at root level)
+        self.root_dir = Path(".")
+        self.engagement_output_dir = self.root_dir / "engagement_output"
+        self.infoagent_output_dir = self.root_dir / "infoagent_output"
+        self.synthesis_output_dir = self.root_dir / "synthesis_output"
+        self.session_data_dir = self.root_dir / "session_data"
         
-        # Simple conversation graph for engagement only
-        self.conversation_graph = self._build_conversation_graph()
+        # Create directories if they don't exist
+        for dir_path in [self.engagement_output_dir, self.infoagent_output_dir, 
+                        self.synthesis_output_dir, self.session_data_dir]:
+            dir_path.mkdir(exist_ok=True)
         
-        # Track session states in memory for faster access
+        # Track session states in memory
         self._session_states = {}
         
-        logger.info("Production QBR Orchestrator initialized successfully")
+        logger.info("File-based QBR Orchestrator initialized successfully")
+        logger.info(f"Engagement output: {self.engagement_output_dir}")
+        logger.info(f"Info gatherer output: {self.infoagent_output_dir}")
+        logger.info(f"Synthesis output: {self.synthesis_output_dir}")
+        logger.info(f"Session data: {self.session_data_dir}")
     
-    def _build_conversation_graph(self) -> CompiledStateGraph:
-        """Build a simple graph for engagement conversations only."""
-        workflow = StateGraph(ProductionOrchestratorState)
-        
-        # Single node for engagement
-        workflow.add_node("engagement", self._engagement_node)
-        
-        # Simple linear flow
-        workflow.add_edge(START, "engagement")
-        workflow.add_edge("engagement", END)
-        
-        return workflow.compile()
-    
-    async def process_conversation_message(self, session_id: str, user_message: str) -> ProductionOrchestratorState:
+    async def process_conversation_message(self, session_id: str, user_message: str) -> FileBasedOrchestratorState:
         """Process a single conversation message through the engagement agent."""
         try:
             logger.info(f"Processing message for session {session_id}")
             
-            # 🔧 FIX: Load existing session state instead of creating new one
+            # Load or create session state
             if session_id in self._session_states:
                 state = self._session_states[session_id]
                 logger.info(f"Loaded existing session state with {len(state.conversation_messages)} messages")
             else:
-                # Load from disk if available
-                state = self._load_session_state(session_id)
-                if state is None:
-                    # Create new state only if none exists
-                    state = ProductionOrchestratorState(
-                        session_id=session_id,
-                        conversation_messages=[]
-                    )
-                    logger.info(f"Created new session state for {session_id}")
-                else:
-                    logger.info(f"Loaded session state from disk with {len(state.conversation_messages)} messages")
-                
-                # Cache in memory
+                state = FileBasedOrchestratorState(
+                    session_id=session_id,
+                    conversation_messages=[],
+                    session_folder=str(self.session_data_dir / session_id)
+                )
+                # Create session folder
+                session_folder = Path(state.session_folder)
+                session_folder.mkdir(exist_ok=True)
+                logger.info(f"Created new session state for {session_id}")
                 self._session_states[session_id] = state
             
             # Update with current user input
             state.user_input = user_message
             
             # Add user message to conversation history
-            state.conversation_messages.append({
+            user_msg = {
                 "role": "user",
                 "content": user_message,
                 "timestamp": datetime.now().isoformat()
-            })
+            }
+            state.conversation_messages.append(user_msg)
             
-            # Process through engagement graph
-            result = await self.conversation_graph.ainvoke(state)
+            # Process through engagement agent
+            logger.info("Calling engagement agent...")
+            response = self.engagement_agent.process_message(session_id, user_message)
             
-            # Handle result format (LangGraph can return dict or state object)
-            if isinstance(result, dict):
-                final_state = ProductionOrchestratorState(**result)
+            # Handle response format
+            if isinstance(response, dict):
+                reply_text = response.get("reply", str(response))
+                spec_complete = response.get("spec_complete", False)
             else:
-                final_state = result
+                reply_text = str(response)
+                spec_complete = self.engagement_agent.is_complete(session_id)
             
-            # 🔧 FIX: Update cached state and save to disk
-            self._session_states[session_id] = final_state
-            self._save_session_state(session_id, final_state)
+            # Update state
+            state.engagement_response = reply_text
+            state.current_phase = "engagement"
             
-            # Save conversation history separately for backup
-            self._save_conversation_history(session_id, final_state.conversation_messages)
+            # Add assistant response to conversation
+            assistant_msg = {
+                "role": "assistant",
+                "content": reply_text,
+                "timestamp": datetime.now().isoformat()
+            }
+            state.conversation_messages.append(assistant_msg)
             
-            # Save engagement state if complete
-            if final_state.is_engagement_complete:
-                self._save_engagement_state(session_id, final_state)
-                logger.info(f"Engagement complete for session {session_id}")
+            # Check completion status
+            if spec_complete or self.engagement_agent.is_complete(session_id):
+                state.is_engagement_complete = True
+                state.final_qbr_spec = self.engagement_agent.get_final_spec(session_id)
+                state.completion_percentage = 33.0
+                
+                # Copy engagement output files to session folder
+                await self._copy_engagement_files_to_session(state)
+                
+                logger.info(f"Engagement completed for session {session_id}")
+            else:
+                # Get completion percentage
+                try:
+                    pct = self.engagement_agent.get_completion_percentage(session_id)
+                    state.completion_percentage = min(pct * 0.33, 32.0)
+                except:
+                    state.completion_percentage = 10.0
             
-            return final_state
+            # Save session state
+            self._save_session_state(session_id, state)
+            
+            return state
             
         except Exception as e:
             logger.error(f"Error processing conversation message: {e}")
-            error_state = ProductionOrchestratorState(
+            error_state = FileBasedOrchestratorState(
                 session_id=session_id,
                 user_input=user_message,
                 error_message=str(e),
                 current_phase="error"
             )
-            # Save error state too
             self._session_states[session_id] = error_state
             return error_state
     
-    async def complete_qbr_workflow(self, session_id: str) -> ProductionOrchestratorState:
+    async def complete_qbr_workflow(self, session_id: str) -> FileBasedOrchestratorState:
         """Complete the full QBR workflow: Information Gathering + Synthesis."""
         try:
             logger.info(f"Starting complete QBR workflow for session {session_id}")
             
-            # 🔧 FIX: Load state from memory first, then disk
-            if session_id in self._session_states:
-                state = self._session_states[session_id]
-            else:
-                state = self._load_engagement_state(session_id)
-                if state:
-                    self._session_states[session_id] = state
+            # Load session state
+            if session_id not in self._session_states:
+                raise Exception("No session state found. Complete engagement first.")
             
-            if not state:
-                raise Exception("No completed engagement state found. Complete engagement first.")
+            state = self._session_states[session_id]
             
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available. Engagement may not be complete.")
+            if not state.is_engagement_complete:
+                raise Exception("Engagement not complete. Cannot proceed to workflow.")
             
             # Step 1: Information Gathering
-            logger.info("Executing information gathering phase...")
+            logger.info("🔄 Step 1: Running Information Gatherer...")
             state.current_phase = "information_gathering"
             state.completion_percentage = 50.0
             
-            state = self._information_gathering_node(state)
-            
-            if state.error_message:
-                logger.error(f"Information gathering failed: {state.error_message}")
-                self._session_states[session_id] = state
+            # Run information gatherer with existing config
+            try:
+                info_config = INFO_GATHERER_CONFIG.copy()
+                info_config["INPUT_JSONS_PATH"] = str(self.engagement_output_dir)
+                info_config["OUTPUT_DIR"] = str(self.infoagent_output_dir)
+                
+                results = run_information_gatherer(info_config)
+                logger.info(f"Information gatherer completed with {len(results)} results")
+                
+                state.info_gathering_complete = True
+                state.completion_percentage = 66.0
+                
+                # Copy info gatherer output files to session folder
+                await self._copy_info_gatherer_files_to_session(state)
+                
+            except Exception as e:
+                logger.error(f"Information gathering failed: {e}")
+                state.error_message = f"Information gathering failed: {str(e)}"
                 return state
             
             # Step 2: Synthesis
-            logger.info("Executing synthesis phase...")
+            logger.info("🔄 Step 2: Running Synthesis Agent...")
             state.current_phase = "synthesis"
             state.completion_percentage = 80.0
             
-            state = self._synthesis_node(state)
-            
-            if state.error_message:
-                logger.error(f"Synthesis failed: {state.error_message}")
-                self._session_states[session_id] = state
+            try:
+                # Create synthesis agent
+                synthesis_agent = SynthesisAgentFactory.create_test_agent(data_mode="local")
+                
+                # Prepare synthesis inputs
+                spec = state.final_qbr_spec
+                tables_manifest = self._load_json_file(self.infoagent_output_dir / "tables_manifest.json") or []
+                mappings = self._load_json_file(self.infoagent_output_dir / "mappings.json") or {}
+                
+                # Generate presentation
+                result = synthesis_agent.generate_presentation(
+                    spec=spec,
+                    tables_manifest=tables_manifest,
+                    mappings=mappings
+                )
+                
+                state.presentation_result = result
+                state.synthesis_complete = True
+                state.completion_percentage = 100.0
+                
+                # Copy synthesis output files to session folder
+                await self._copy_synthesis_files_to_session(state)
+                
+                logger.info(f"Synthesis completed successfully for session {session_id}")
+                
+            except Exception as e:
+                logger.error(f"Synthesis failed: {e}")
+                state.error_message = f"Synthesis failed: {str(e)}"
                 return state
             
             # Complete
             state.current_phase = "complete"
-            state.completion_percentage = 100.0
+            self._save_session_state(session_id, state)
             
-            # Save final state
-            self._session_states[session_id] = state
-            self._save_final_state(session_id, state)
-            
-            logger.info(f"QBR workflow completed successfully for session {session_id}")
             return state
             
         except Exception as e:
             logger.error(f"Error completing QBR workflow: {e}")
-            error_state = ProductionOrchestratorState(
-                session_id=session_id,
-                error_message=str(e),
-                current_phase="error",
-                completion_percentage=0.0
-            )
-            self._session_states[session_id] = error_state
-            return error_state
-    
-    def _engagement_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle engagement phase with the real engagement agent."""
-        try:
-            logger.info(f"Processing engagement for session {state.session_id}")
-            
-            # 🔧 FIX: The engagement agent maintains its own session memory
-            # We just need to call it with the same session_id consistently
-            response = self.engagement_agent.process_message(
-                state.session_id,
-                state.user_input
-            )
-            
-            # Update state
-            state.engagement_response = response
-            state.current_phase = "engagement"
-            
-            # Add response to conversation
-            state.conversation_messages.append({
-                "role": "assistant",
-                "content": response,
-                "timestamp": datetime.now().isoformat()
-            })
-            
-            # Check completion status from the agent
-            state.is_engagement_complete = self.engagement_agent.is_complete(state.session_id)
-            
-            if state.is_engagement_complete:
-                # Get final specification
-                state.final_qbr_spec = self.engagement_agent.get_final_spec(state.session_id)
-                state.completion_percentage = 33.0
-                logger.info(f"Engagement completed for session {state.session_id}")
-            else:
-                # Get completion percentage
-                try:
-                    pct = self.engagement_agent.get_completion_percentage(state.session_id)
-                    state.completion_percentage = min(pct * 0.33, 32.0)  # Cap at 32% until complete
-                except Exception as e:
-                    logger.warning(f"Could not get completion percentage: {e}")
-                    state.completion_percentage = 10.0  # Default partial completion
-            
-            return state
-            
-        except Exception as e:
-            logger.error(f"Engagement node error: {e}")
+            state = self._session_states.get(session_id, FileBasedOrchestratorState(session_id=session_id))
             state.error_message = str(e)
             state.current_phase = "error"
             return state
     
-    def _information_gathering_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle information gathering with the real info gatherer."""
+    async def _copy_engagement_files_to_session(self, state: FileBasedOrchestratorState):
+        """Copy engagement output files to session folder."""
         try:
-            logger.info(f"Starting information gathering for session {state.session_id}")
+            session_folder = Path(state.session_folder)
+            engagement_session_folder = session_folder / "engagement_output"
+            engagement_session_folder.mkdir(exist_ok=True)
             
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available for information gathering")
+            # Copy all files from engagement_output
+            copied_files = []
+            for file_path in self.engagement_output_dir.glob("*"):
+                if file_path.is_file():
+                    dest_path = engagement_session_folder / file_path.name
+                    shutil.copy2(file_path, dest_path)
+                    copied_files.append(str(dest_path))
+                    logger.info(f"Copied engagement file: {file_path.name}")
             
-            # Create session-specific output directory
-            session_output_dir = self.data_dir / state.session_id / "info_gathering"
-            session_output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Set environment variable for output location
-            original_qbr_out = os.environ.get("QBR_OUT")
-            os.environ["QBR_OUT"] = str(session_output_dir)
-            
-            try:
-                # Run the real information gatherer
-                result = run_information_gatherer(state.final_qbr_spec)
-                logger.info(f"Information gatherer result: {result}")
-                
-            finally:
-                # Restore original environment
-                if original_qbr_out:
-                    os.environ["QBR_OUT"] = original_qbr_out
-                elif "QBR_OUT" in os.environ:
-                    del os.environ["QBR_OUT"]
-            
-            # Update state
-            state.info_gathering_complete = True
-            state.enriched_data_path = str(session_output_dir)
-            
-            # Load generated files if they exist
-            spec_file = session_output_dir / "spec.json"
-            manifest_file = session_output_dir / "tables_manifest.json"
-            mappings_file = session_output_dir / "mappings.json"
-            
-            if spec_file.exists():
-                with open(spec_file, 'r') as f:
-                    enriched_spec = json.load(f)
-                    # Update with enriched spec
-                    state.final_qbr_spec.update(enriched_spec)
-                    logger.info("Loaded enriched specification")
-            
-            if manifest_file.exists():
-                with open(manifest_file, 'r') as f:
-                    state.tables_manifest = json.load(f)
-                    logger.info(f"Loaded tables manifest with {len(state.tables_manifest)} tables")
-            
-            if mappings_file.exists():
-                with open(mappings_file, 'r') as f:
-                    state.mappings = json.load(f)
-                    logger.info(f"Loaded mappings with {len(state.mappings)} entries")
-            
-            logger.info(f"Information gathering completed for session {state.session_id}")
-            return state
+            state.engagement_output_files = copied_files
+            logger.info(f"Copied {len(copied_files)} engagement files to session {state.session_id}")
             
         except Exception as e:
-            logger.error(f"Information gathering error: {e}")
-            state.error_message = str(e)
-            state.current_phase = "error"
-            return state
+            logger.error(f"Error copying engagement files: {e}")
     
-    def _synthesis_node(self, state: ProductionOrchestratorState) -> ProductionOrchestratorState:
-        """Handle synthesis with the real synthesis agent."""
+    async def _copy_info_gatherer_files_to_session(self, state: FileBasedOrchestratorState):
+        """Copy info gatherer output files to session folder."""
         try:
-            logger.info(f"Starting synthesis for session {state.session_id}")
+            session_folder = Path(state.session_folder)
+            info_session_folder = session_folder / "infoagent_output"
+            info_session_folder.mkdir(exist_ok=True)
             
-            if not state.final_qbr_spec:
-                raise Exception("No QBR specification available for synthesis")
+            # Copy all files from infoagent_output
+            copied_files = []
+            for file_path in self.infoagent_output_dir.glob("*"):
+                if file_path.is_file():
+                    dest_path = info_session_folder / file_path.name
+                    shutil.copy2(file_path, dest_path)
+                    copied_files.append(str(dest_path))
+                    logger.info(f"Copied info gatherer file: {file_path.name}")
             
-            # Create synthesis agent
-            synthesis_agent = SynthesisAgentFactory.create_test_agent(data_mode="local")
-            
-            # Prepare parameters
-            spec = state.final_qbr_spec
-            tables_manifest = state.tables_manifest or []
-            mappings = state.mappings or {}
-            
-            logger.info(f"Generating presentation with {len(tables_manifest)} tables and {len(mappings)} mappings")
-            
-            # Generate presentation
-            result = synthesis_agent.generate_presentation(
-                spec=spec,
-                tables_manifest=tables_manifest,
-                mappings=mappings
-            )
-            
-            # Update state
-            state.presentation_result = result
-            state.synthesis_complete = True
-            
-            if result.get('status') == 'success':
-                state.presentation_path = result.get('presentation_path')
-                logger.info(f"Synthesis completed successfully. Presentation: {state.presentation_path}")
-            else:
-                error_msg = result.get('error', 'Unknown synthesis error')
-                logger.error(f"Synthesis failed: {error_msg}")
-                raise Exception(error_msg)
-            
-            return state
+            state.info_gatherer_output_files = copied_files
+            logger.info(f"Copied {len(copied_files)} info gatherer files to session {state.session_id}")
             
         except Exception as e:
-            logger.error(f"Synthesis error: {e}")
-            state.error_message = str(e)
-            state.current_phase = "error"
-            return state
+            logger.error(f"Error copying info gatherer files: {e}")
     
-    # 🔧 FIX: Enhanced state management methods
-    def _load_session_state(self, session_id: str) -> Optional[ProductionOrchestratorState]:
-        """Load complete session state from disk."""
+    async def _copy_synthesis_files_to_session(self, state: FileBasedOrchestratorState):
+        """Copy synthesis output files to session folder."""
         try:
-            state_file = self.data_dir / f"{session_id}_session_state.json"
-            if state_file.exists():
-                with open(state_file, 'r') as f:
-                    state_data = json.load(f)
-                return ProductionOrchestratorState(**state_data)
+            session_folder = Path(state.session_folder)
+            synthesis_session_folder = session_folder / "synthesis_output"
+            synthesis_session_folder.mkdir(exist_ok=True)
+            
+            # Copy all files from synthesis_output
+            copied_files = []
+            for file_path in self.synthesis_output_dir.glob("*"):
+                if file_path.is_file():
+                    dest_path = synthesis_session_folder / file_path.name
+                    shutil.copy2(file_path, dest_path)
+                    copied_files.append(str(dest_path))
+                    logger.info(f"Copied synthesis file: {file_path.name}")
+            
+            state.synthesis_output_files = copied_files
+            logger.info(f"Copied {len(copied_files)} synthesis files to session {state.session_id}")
+            
         except Exception as e:
-            logger.warning(f"Could not load session state: {e}")
+            logger.error(f"Error copying synthesis files: {e}")
+    
+    def _load_json_file(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        """Load JSON file safely."""
+        try:
+            if file_path.exists():
+                with open(file_path, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load JSON file {file_path}: {e}")
         return None
     
-    def _save_session_state(self, session_id: str, state: ProductionOrchestratorState):
-        """Save complete session state to disk."""
+    def _save_session_state(self, session_id: str, state: FileBasedOrchestratorState):
+        """Save session state to file."""
         try:
-            state_file = self.data_dir / f"{session_id}_session_state.json"
+            session_folder = Path(state.session_folder)
+            state_file = session_folder / "session_state.json"
             with open(state_file, 'w') as f:
                 json.dump(state.dict(), f, indent=2)
         except Exception as e:
             logger.error(f"Could not save session state: {e}")
-    
-    def _load_conversation_history(self, session_id: str) -> list:
-        """Load conversation history from disk."""
-        try:
-            history_file = self.data_dir / f"{session_id}_conversation.json"
-            if history_file.exists():
-                with open(history_file, 'r') as f:
-                    return json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load conversation history: {e}")
-        return []
-    
-    def _save_conversation_history(self, session_id: str, messages: list):
-        """Save conversation history to disk."""
-        try:
-            history_file = self.data_dir / f"{session_id}_conversation.json"
-            with open(history_file, 'w') as f:
-                json.dump(messages, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save conversation history: {e}")
-    
-    def _load_engagement_state(self, session_id: str) -> Optional[ProductionOrchestratorState]:
-        """Load completed engagement state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_engagement_state.json"
-            if state_file.exists():
-                with open(state_file, 'r') as f:
-                    state_data = json.load(f)
-                return ProductionOrchestratorState(**state_data)
-        except Exception as e:
-            logger.error(f"Could not load engagement state: {e}")
-        return None
-    
-    def _save_engagement_state(self, session_id: str, state: ProductionOrchestratorState):
-        """Save completed engagement state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_engagement_state.json"
-            with open(state_file, 'w') as f:
-                json.dump(state.dict(), f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save engagement state: {e}")
-    
-    def _save_final_state(self, session_id: str, state: ProductionOrchestratorState):
-        """Save final workflow state."""
-        try:
-            state_file = self.data_dir / f"{session_id}_final_state.json"
-            with open(state_file, 'w') as f:
-                json.dump(state.dict(), f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save final state: {e}")
     
     def get_session_status(self, session_id: str) -> Dict[str, Any]:
         """Get comprehensive session status."""
@@ -513,86 +415,56 @@ class ProductionQBROrchestrator:
                 "timestamp": datetime.now().isoformat()
             }
             
-            # 🔧 FIX: Check memory cache first
             if session_id in self._session_states:
                 state = self._session_states[session_id]
-                status["message_count"] = len(state.conversation_messages)
-                status["has_conversation"] = len(state.conversation_messages) > 0
-                status["current_phase"] = state.current_phase
-                status["completion_percentage"] = state.completion_percentage
-            else:
-                # Fallback to disk
-                history = self._load_conversation_history(session_id)
-                status["message_count"] = len(history)
-                status["has_conversation"] = len(history) > 0
-            
-            # Check engagement status with the agent directly
-            try:
-                is_complete = self.engagement_agent.is_complete(session_id)
-                completion_pct = self.engagement_agent.get_completion_percentage(session_id)
-                
-                status["engagement"] = {
-                    "is_complete": is_complete,
-                    "completion_percentage": completion_pct
-                }
-                
-                if is_complete:
-                    spec = self.engagement_agent.get_final_spec(session_id)
-                    status["engagement"]["has_spec"] = spec is not None
-                    status["can_proceed_to_workflow"] = True
-                else:
-                    status["can_proceed_to_workflow"] = False
-                    
-            except Exception as e:
-                status["engagement"] = {"error": str(e)}
-                status["can_proceed_to_workflow"] = False
-            
-            # Check workflow completion from cached state
-            if session_id in self._session_states:
-                state = self._session_states[session_id]
-                status["workflow"] = {
+                status.update({
                     "current_phase": state.current_phase,
                     "completion_percentage": state.completion_percentage,
+                    "message_count": len(state.conversation_messages),
+                    "has_conversation": len(state.conversation_messages) > 0,
+                    "session_folder": state.session_folder
+                })
+                
+                # Engagement status
+                status["engagement"] = {
+                    "is_complete": state.is_engagement_complete,
+                    "completion_percentage": self.engagement_agent.get_completion_percentage(session_id) if hasattr(self.engagement_agent, 'get_completion_percentage') else 0,
+                    "output_files": len(state.engagement_output_files)
+                }
+                
+                # Workflow status
+                status["workflow"] = {
+                    "current_phase": state.current_phase,
                     "info_gathering_complete": state.info_gathering_complete,
                     "synthesis_complete": state.synthesis_complete,
-                    "has_presentation": state.presentation_path is not None
+                    "has_presentation": state.presentation_result is not None,
+                    "info_files": len(state.info_gatherer_output_files),
+                    "synthesis_files": len(state.synthesis_output_files)
                 }
+            else:
+                status.update({
+                    "message_count": 0,
+                    "has_conversation": False,
+                    "current_phase": "not_started"
+                })
             
             return status
             
         except Exception as e:
             logger.error(f"Error getting session status: {e}")
-            return {
-                "session_id": session_id,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat()
-            }
+            return {"session_id": session_id, "error": str(e)}
     
     def cleanup_session(self, session_id: str):
         """Clean up session data."""
         try:
-            # Remove from memory cache
+            # Remove from memory
             if session_id in self._session_states:
                 del self._session_states[session_id]
             
-            # Remove session files
-            files_to_remove = [
-                f"{session_id}_conversation.json",
-                f"{session_id}_engagement_state.json", 
-                f"{session_id}_final_state.json",
-                f"{session_id}_session_state.json"
-            ]
-            
-            for filename in files_to_remove:
-                file_path = self.data_dir / filename
-                if file_path.exists():
-                    file_path.unlink()
-            
-            # Remove session directory
-            session_dir = self.data_dir / session_id
-            if session_dir.exists():
-                import shutil
-                shutil.rmtree(session_dir)
+            # Remove session folder
+            session_folder = self.session_data_dir / session_id
+            if session_folder.exists():
+                shutil.rmtree(session_folder)
             
             logger.info(f"Cleaned up session {session_id}")
             
