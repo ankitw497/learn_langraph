@@ -1,7 +1,3 @@
-"""
-Production Streamlit UI for QBR Orchestrator with Real Agents.
-Clear separation: Engagement (chat) vs Full Workflow (info gathering + synthesis)
-"""
 import asyncio
 import json
 import logging
@@ -17,26 +13,26 @@ src_dir = current_dir.parent
 sys.path.insert(0, str(src_dir))
 
 import streamlit as st
-from orchestrator import ProductionQBROrchestrator
+from orchestrator.file_based_orchestrator import FileBasedQBROrchestrator
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class ProductionQBRStreamlitApp:
-    """Production Streamlit application with clear agent execution phases."""
+class FileBasedQBRStreamlitApp:
+    """File-based Streamlit application with auto-workflow progression."""
     
     def __init__(self):
-        # 🔧 FIX: Use session state to maintain orchestrator instance
+        # Use session state to maintain orchestrator instance
         if 'orchestrator' not in st.session_state:
-            st.session_state.orchestrator = ProductionQBROrchestrator()
+            st.session_state.orchestrator = FileBasedQBROrchestrator()
         self.orchestrator = st.session_state.orchestrator
     
     def run(self):
         """Run the Streamlit application."""
         st.set_page_config(
-            page_title="QBR Orchestrator - Production",
+            page_title="QBR Orchestrator - File Based",
             page_icon="📊", 
             layout="wide"
         )
@@ -85,11 +81,10 @@ class ProductionQBRStreamlitApp:
         if 'json_completion_percentage' not in st.session_state:
             st.session_state.json_completion_percentage = 0.0
         
-        # 🔧 FIX: Load existing conversation on app restart
-        if len(st.session_state.messages) == 0:
-            self._load_existing_conversation()
-            
-        # 🔧 FIX: Add initial greeting if no messages exist
+        if 'auto_trigger_workflow' not in st.session_state:
+            st.session_state.auto_trigger_workflow = False
+        
+        # Add initial greeting if no messages exist
         if len(st.session_state.messages) == 0:
             self._add_initial_greeting()
     
@@ -97,36 +92,15 @@ class ProductionQBRStreamlitApp:
         """Add initial greeting from the engagement agent."""
         initial_greeting = {
             "role": "assistant",
-            "content": "Hello! I'm your QBR Engagement Agent. I'll help you create a comprehensive Quarterly Business Review. To get started, could you please tell me:\n\n1. What company or organization is this QBR for?\n2. What time period should we cover?\n3. What are the key business areas you'd like to focus on?\n\nFeel free to provide as much detail as you'd like!",
-            "timestamp": datetime.now().strftime("%H:%M:%S")
+            "content": "👋 Hello! I'm your QBR assistant. I can help you create a new QBR or refresh an existing report. What would you like to do today?"
         }
         st.session_state.messages.append(initial_greeting)
         logger.info("Added initial greeting message")
     
-    def _load_existing_conversation(self):
-        """Load existing conversation from orchestrator if available."""
-        try:
-            status = self.orchestrator.get_session_status(st.session_state.session_id)
-            
-            if status.get("has_conversation", False):
-                # Load conversation messages from orchestrator
-                if hasattr(self.orchestrator, '_session_states') and st.session_state.session_id in self.orchestrator._session_states:
-                    state = self.orchestrator._session_states[st.session_state.session_id]
-                    st.session_state.messages = state.conversation_messages.copy()
-                    st.session_state.engagement_complete = state.is_engagement_complete
-                    st.session_state.qbr_spec = state.final_qbr_spec
-                    st.session_state.current_phase = state.current_phase
-                    st.session_state.completion_percentage = state.completion_percentage
-                    
-                    logger.info(f"Loaded {len(st.session_state.messages)} existing messages for session {st.session_state.session_id}")
-                
-        except Exception as e:
-            logger.warning(f"Could not load existing conversation: {e}")
-    
     def _render_header(self):
         """Render the main header with phase indicators."""
-        st.title("📊 QBR Orchestrator - Production")
-        st.caption("Real AI Agents: Engagement Agent (Chat) → Information Gatherer → Synthesis Agent")
+        st.title("📊 QBR Orchestrator - File Based")
+        st.caption("Real AI Agents: Engagement Agent → Information Gatherer → Synthesis Agent")
         
         # Phase indicators
         col1, col2, col3, col4 = st.columns(4)
@@ -160,25 +134,28 @@ class ProductionQBRStreamlitApp:
         elif st.session_state.workflow_running:
             return {"display": "⚙️ Workflow Running", "description": "Generating QBR presentation"}
         elif st.session_state.engagement_complete:
-            return {"display": "💬 Engagement Done", "description": "Ready to start full workflow"}
+            return {"display": "🚀 Auto-Processing", "description": "Automatically starting full workflow"}
         else:
             return {"display": "💬 Chatting", "description": "Gathering QBR requirements"}
     
     def _render_sidebar(self):
-        """Render sidebar with controls, status, and examples."""
+        """Render sidebar with controls, status, and file tracking."""
         with st.sidebar:
             st.header("🎛️ Control Panel")
             
             # Real-time session status from orchestrator
             self._render_session_status()
             
-            # 🔧 FIX: Add JSON completion and frustration metrics
+            # Engagement metrics
             self._render_engagement_metrics()
+            
+            # File tracking
+            self._render_file_tracking()
             
             # Phase explanation
             self._render_phase_explanation()
             
-            # Workflow controls
+            # Workflow controls (simplified)
             self._render_workflow_controls()
             
             # Debug information
@@ -204,6 +181,9 @@ class ProductionQBRStreamlitApp:
                         st.success("✅ Engagement Complete")
                         st.session_state.engagement_complete = True
                         st.session_state.completion_percentage = 33.0
+                        # 🎯 Auto-trigger workflow when engagement completes
+                        if not st.session_state.auto_trigger_workflow and not st.session_state.workflow_running:
+                            st.session_state.auto_trigger_workflow = True
                     else:
                         st.info(f"💬 Engagement: {completion_pct:.1f}%")
                         st.session_state.completion_percentage = completion_pct * 0.33
@@ -242,7 +222,7 @@ class ProductionQBRStreamlitApp:
                 completion_pct = self.orchestrator.engagement_agent.get_completion_percentage(st.session_state.session_id)
                 st.session_state.json_completion_percentage = completion_pct
             
-            # Try to get frustration index if available
+            # Get frustration index if available
             frustration = 0.0
             if hasattr(self.orchestrator.engagement_agent, 'get_frustration_index'):
                 frustration = self.orchestrator.engagement_agent.get_frustration_index(st.session_state.session_id)
@@ -285,6 +265,49 @@ class ProductionQBRStreamlitApp:
             logger.warning(f"Could not get engagement metrics: {e}")
             st.warning("Metrics temporarily unavailable")
     
+    def _render_file_tracking(self):
+        """Render file tracking information."""
+        st.subheader("📁 File Tracking")
+        
+        try:
+            status = self.orchestrator.get_session_status(st.session_state.session_id)
+            
+            # Session folder info
+            session_folder = status.get("session_folder")
+            if session_folder:
+                st.text(f"📂 Session Folder:")
+                st.code(session_folder, language="text")
+            
+            # File counts
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                eng_files = status.get("engagement", {}).get("output_files", 0)
+                st.metric("📝 Engagement Files", eng_files)
+            
+            with col2:
+                info_files = status.get("workflow", {}).get("info_files", 0)
+                st.metric("📊 Info Files", info_files)
+            
+            with col3:
+                synth_files = status.get("workflow", {}).get("synthesis_files", 0)
+                st.metric("📋 Synthesis Files", synth_files)
+            
+            # Show session folder contents if it exists
+            if session_folder and Path(session_folder).exists():
+                with st.expander("📂 Session Files"):
+                    session_path = Path(session_folder)
+                    for subfolder in ["engagement_output", "infoagent_output", "synthesis_output"]:
+                        subfolder_path = session_path / subfolder
+                        if subfolder_path.exists():
+                            st.text(f"{subfolder}/")
+                            for file_path in subfolder_path.glob("*"):
+                                if file_path.is_file():
+                                    st.text(f"  📄 {file_path.name}")
+        
+        except Exception as e:
+            logger.warning(f"Could not get file tracking info: {e}")
+    
     def _render_phase_explanation(self):
         """Explain when each agent is called."""
         st.subheader("🔄 Agent Execution Flow")
@@ -293,19 +316,19 @@ class ProductionQBRStreamlitApp:
             {
                 "name": "💬 Engagement Agent",
                 "when": "Every chat message",
-                "what": "Understands requirements, asks clarifying questions",
+                "what": "Saves spec to engagement_output/",
                 "status": "✅" if st.session_state.engagement_complete else "🔄" if st.session_state.completion_percentage > 0 else "⏳"
             },
             {
                 "name": "📊 Information Gatherer", 
-                "when": "After engagement completion",
-                "what": "Enriches data, generates tables and mappings",
+                "when": "Auto-triggered after engagement",
+                "what": "Reads engagement_output/, saves to infoagent_output/",
                 "status": "✅" if st.session_state.completion_percentage >= 66 else "⏳"
             },
             {
                 "name": "📝 Synthesis Agent",
-                "when": "After information gathering", 
-                "what": "Creates PowerPoint presentation",
+                "when": "Auto-triggered after info gathering", 
+                "what": "Reads both folders, saves to synthesis_output/",
                 "status": "✅" if st.session_state.workflow_complete else "⏳"
             }
         ]
@@ -318,18 +341,14 @@ class ProductionQBRStreamlitApp:
                 st.divider()
     
     def _render_workflow_controls(self):
-        """Render workflow control buttons."""
-        st.subheader("🚀 Workflow Controls")
+        """Render simplified workflow control buttons."""
+        st.subheader("🚀 Controls")
         
-        # Start full workflow button
-        if st.session_state.engagement_complete and not st.session_state.workflow_running and not st.session_state.workflow_complete:
-            if st.button("▶️ Start Full QBR Workflow", type="primary", use_container_width=True):
-                st.session_state.trigger_workflow = True
-                st.rerun()
-            
-            st.info("💡 This will run Information Gatherer + Synthesis Agent")
+        # Show auto-flow status
+        if st.session_state.engagement_complete and not st.session_state.workflow_complete:
+            st.info("🤖 **Auto-Flow Enabled**\nWorkflow will start automatically after engagement completes!")
         
-        # Reset buttons
+        # Reset buttons only
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🗑️ Clear Chat", use_container_width=True, disabled=st.session_state.workflow_running):
@@ -341,6 +360,7 @@ class ProductionQBRStreamlitApp:
                 st.session_state.completion_percentage = 0.0
                 st.session_state.json_completion_percentage = 0.0
                 st.session_state.frustration_index = 0.0
+                st.session_state.auto_trigger_workflow = False
                 st.rerun()
         
         with col2:
@@ -360,17 +380,18 @@ class ProductionQBRStreamlitApp:
                 "Current Phase": st.session_state.current_phase,
                 "Completion %": st.session_state.completion_percentage,
                 "JSON Completion %": st.session_state.json_completion_percentage,
-                "Frustration Index": st.session_state.frustration_index
+                "Frustration Index": st.session_state.frustration_index,
+                "Auto Trigger": st.session_state.auto_trigger_workflow
             }
             st.json(debug_info)
     
     def _render_main_content(self):
         """Render main content area."""
-        # Handle triggers
-        self._handle_triggers()
+        # Handle auto-workflow trigger first
+        self._handle_auto_workflow_trigger()
         
         # Main content tabs
-        tab1, tab2 = st.tabs(["💬 Chat with Engagement Agent", "📊 QBR Results"])
+        tab1, tab2 = st.tabs(["💬 Chat with QBR Assistant", "📊 QBR Results"])
         
         with tab1:
             self._render_chat_interface()
@@ -378,54 +399,85 @@ class ProductionQBRStreamlitApp:
         with tab2:
             self._render_results_tab()
     
-    def _handle_triggers(self):
-        """Handle various UI triggers."""
-        # Workflow trigger
-        if hasattr(st.session_state, 'trigger_workflow'):
+    def _handle_auto_workflow_trigger(self):
+        """Handle automatic workflow trigger when engagement completes."""
+        if st.session_state.auto_trigger_workflow and not st.session_state.workflow_running:
+            logger.info("Auto-triggering workflow after engagement completion")
+            st.session_state.auto_trigger_workflow = False
             self._start_full_workflow()
-            del st.session_state.trigger_workflow
     
     def _render_chat_interface(self):
         """Render the chat interface for engagement agent."""
-        st.subheader("💬 Engagement Agent Chat")
-        st.caption("The engagement agent will ask questions to understand your QBR requirements")
+        st.subheader("💬 QBR Assistant Chat")
+        st.caption("The QBR assistant will understand your requirements and automatically start the workflow")
         
-        # Display chat messages
+        # Show workflow progress if running
+        if st.session_state.workflow_running:
+            self._render_workflow_progress()
+        
+        # Display chat messages (without timestamps)
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-                
-                if "timestamp" in message:
-                    st.caption(f"🕒 {message['timestamp']}")
         
-        # Chat input - 🔧 FIX: Moved outside of any conditional or button logic
-        if not st.session_state.workflow_running:
-            prompt = st.chat_input("Describe your QBR requirements...")
+        # Chat input - disable when workflow is running
+        if not st.session_state.workflow_running and not st.session_state.workflow_complete:
+            prompt = st.chat_input("Tell me about your QBR requirements...")
             if prompt:
                 self._process_engagement_message(prompt)
-        else:
-            st.info("💡 Chat is disabled while workflow is running")
+        elif st.session_state.workflow_running:
+            st.info("🔄 **Workflow in progress...** The system is automatically processing your QBR.")
+        elif st.session_state.workflow_complete:
+            st.success("✅ **QBR Generation Complete!** Check the Results tab for your presentation.")
         
         # Show engagement completion status
-        if st.session_state.engagement_complete:
-            st.success("✅ **Engagement Complete!** Ready to generate your QBR presentation.")
-            
-            if st.session_state.qbr_spec:
-                with st.expander("📋 Final QBR Specification"):
-                    st.json(st.session_state.qbr_spec)
+        if st.session_state.engagement_complete and not st.session_state.workflow_running and not st.session_state.workflow_complete:
+            st.success("✅ **Requirements Gathered!** Starting automatic workflow...")
+    
+    def _render_workflow_progress(self):
+        """Render workflow progress bar and status."""
+        st.subheader("🔄 Workflow Progress")
+        
+        # Progress bar
+        progress = st.session_state.completion_percentage
+        progress_bar = st.progress(progress / 100.0)
+        
+        # Status text based on phase
+        if st.session_state.current_phase == "information_gathering":
+            st.info("📊 **Information Gatherer Running**\nReading engagement output and enriching data...")
+        elif st.session_state.current_phase == "synthesis":
+            st.info("📝 **Synthesis Agent Running**\nCreating PowerPoint presentation...")
+        else:
+            st.info(f"🔄 **Processing** - Current phase: {st.session_state.current_phase}")
+        
+        # Phase checklist
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            status = "✅" if st.session_state.engagement_complete else "⏳"
+            st.write(f"{status} Engagement Complete")
+        
+        with col2:
+            status = "✅" if st.session_state.completion_percentage >= 66 else "🔄" if st.session_state.completion_percentage > 33 else "⏳"
+            st.write(f"{status} Information Gathering")
+        
+        with col3:
+            status = "✅" if st.session_state.workflow_complete else "🔄" if st.session_state.completion_percentage > 66 else "⏳"
+            st.write(f"{status} Synthesis Complete")
     
     def _render_results_tab(self):
         """Render the results tab."""
         if not st.session_state.engagement_complete:
-            st.info("💡 Complete the engagement chat first to see results here.")
+            st.info("💡 Complete the chat conversation first to see results here.")
             return
         
         if st.session_state.workflow_running:
-            st.info("⚙️ Workflow is running... Results will appear here when complete.")
+            st.info("⚙️ Workflow is running automatically... Results will appear here when complete.")
+            self._render_workflow_progress()
             return
         
         if not st.session_state.workflow_complete:
-            st.warning("🚀 Click 'Start Full QBR Workflow' in the sidebar to generate your presentation.")
+            st.warning("🔄 Workflow will start automatically after engagement completes.")
             return
         
         # Show results
@@ -433,11 +485,10 @@ class ProductionQBRStreamlitApp:
     
     def _process_engagement_message(self, user_input: str):
         """Process message through engagement agent only."""
-        # Add user message to chat
+        # Add user message to chat (without timestamp)
         user_message = {
             "role": "user",
-            "content": user_input,
-            "timestamp": datetime.now().strftime("%H:%M:%S")
+            "content": user_input
         }
         st.session_state.messages.append(user_message)
         
@@ -447,9 +498,9 @@ class ProductionQBRStreamlitApp:
         
         # Process through engagement agent
         with st.chat_message("assistant"):
-            with st.spinner("🤔 Engagement agent is thinking..."):
+            with st.spinner("🤔 QBR assistant is thinking..."):
                 try:
-                    # 🎯 ENGAGEMENT AGENT CALLED HERE - for every chat message
+                    # Call orchestrator to handle engagement
                     result = asyncio.run(
                         self.orchestrator.process_conversation_message(
                             st.session_state.session_id,
@@ -463,16 +514,18 @@ class ProductionQBRStreamlitApp:
                         st.error(error_msg)
                         st.session_state.messages.append({
                             "role": "assistant",
-                            "content": error_msg,
-                            "timestamp": datetime.now().strftime("%H:%M:%S")
+                            "content": error_msg
                         })
                     else:
                         # Show engagement response
                         st.markdown(result.engagement_response)
                         
-                        # Add to messages - 🔧 FIX: Don't duplicate, the orchestrator already adds it
-                        # Update session state directly from result
-                        st.session_state.messages = result.conversation_messages.copy()
+                        # Add to messages (without timestamp)
+                        assistant_message = {
+                            "role": "assistant",
+                            "content": result.engagement_response
+                        }
+                        st.session_state.messages.append(assistant_message)
                         
                         # Update session state
                         if result.is_engagement_complete:
@@ -480,70 +533,85 @@ class ProductionQBRStreamlitApp:
                             st.session_state.qbr_spec = result.final_qbr_spec
                             st.session_state.completion_percentage = 33.0
                             
+                            # 🎯 Set auto-trigger flag - workflow will start automatically
+                            st.session_state.auto_trigger_workflow = True
+                            
                             # Show completion message
-                            st.success("🎉 Engagement complete! Ready for full workflow.")
+                            st.success("🎉 Requirements complete! Automatically starting workflow...")
                 
                 except Exception as e:
                     error_msg = f"❌ Error processing message: {str(e)}"
                     st.error(error_msg)
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": error_msg,
-                        "timestamp": datetime.now().strftime("%H:%M:%S")
+                        "content": error_msg
                     })
         
-        # 🔧 FIX: Use st.rerun() only at the end to prevent input box issues
         st.rerun()
     
     def _start_full_workflow(self):
-        """Start the full QBR workflow (Information Gatherer + Synthesis)."""
+        """Start the full QBR workflow automatically (Information Gatherer + Synthesis)."""
         st.session_state.workflow_running = True
         
-        # Create workflow status container
-        with st.container():
-            st.info("🚀 Starting full QBR workflow...")
-            progress_bar = st.progress(0.33)  # Start at 33% (engagement done)
-            status_text = st.empty()
-            
-            try:
-                # Update status
-                status_text.text("📊 Step 2/3: Information Gatherer is analyzing data...")
-                progress_bar.progress(0.5)
-                
-                # Update status  
-                status_text.text("📝 Step 3/3: Synthesis Agent is creating presentation...")
-                progress_bar.progress(0.8)
-                
-                # 🎯 INFORMATION GATHERER + SYNTHESIS AGENTS CALLED HERE
-                result = asyncio.run(
-                    self.orchestrator.complete_qbr_workflow(st.session_state.session_id)
-                )
-                
-                # Handle result
-                if result.error_message:
-                    st.error(f"❌ Workflow failed: {result.error_message}")
-                    status_text.text("❌ Workflow failed")
-                    progress_bar.progress(0.33)
-                else:
-                    # Success
-                    progress_bar.progress(1.0)
-                    status_text.text("✅ QBR presentation complete!")
-                    
-                    st.session_state.workflow_complete = True
-                    st.session_state.presentation_result = result.presentation_result
-                    st.session_state.completion_percentage = 100.0
-                    
-                    st.success("🎉 QBR Generation Complete!")
-                    st.balloons()
-                
-            except Exception as e:
-                st.error(f"❌ Workflow error: {str(e)}")
-                status_text.text("❌ Workflow error")
-                progress_bar.progress(0.33)
-            
-            finally:
-                st.session_state.workflow_running = False
+        # Use a placeholder for dynamic updates
+        placeholder = st.empty()
         
+        with placeholder.container():
+            st.info("🚀 **Starting Automatic QBR Workflow**")
+            
+            # Create progress container
+            progress_container = st.container()
+            
+            with progress_container:
+                progress_bar = st.progress(0.33)  # Start at 33% (engagement done)
+                status_text = st.empty()
+                
+                try:
+                    # Step 1: Information Gatherer
+                    status_text.text("📊 Information Gatherer: Reading engagement output and enriching data...")
+                    progress_bar.progress(0.5)
+                    
+                    # Brief pause to show progress
+                    import time
+                    time.sleep(1)
+                    
+                    # Step 2: Synthesis Agent
+                    status_text.text("📝 Synthesis Agent: Creating PowerPoint presentation...")
+                    progress_bar.progress(0.8)
+                    
+                    # Run full workflow
+                    result = asyncio.run(
+                        self.orchestrator.complete_qbr_workflow(st.session_state.session_id)
+                    )
+                    
+                    # Handle result
+                    if result.error_message:
+                        status_text.text("❌ Workflow failed")
+                        st.error(f"❌ Workflow failed: {result.error_message}")
+                        progress_bar.progress(0.33)
+                    else:
+                        # Success
+                        progress_bar.progress(1.0)
+                        status_text.text("✅ QBR presentation complete!")
+                        
+                        st.session_state.workflow_complete = True
+                        st.session_state.presentation_result = result.presentation_result
+                        st.session_state.completion_percentage = 100.0
+                        
+                        st.success("🎉 **QBR Generation Complete!** Your presentation is ready in the Results tab.")
+                        st.balloons()
+                    
+                except Exception as e:
+                    status_text.text("❌ Workflow error")
+                    st.error(f"❌ Workflow error: {str(e)}")
+                    progress_bar.progress(0.33)
+                
+                finally:
+                    st.session_state.workflow_running = False
+        
+        # Clear the placeholder after completion
+        time.sleep(2)
+        placeholder.empty()
         st.rerun()
     
     def _render_final_results(self):
@@ -563,9 +631,7 @@ class ProductionQBRStreamlitApp:
                 st.metric("💡 Insights Found", result.get('insights_count', 0))
             
             with col3:
-                if result.get('qa_results'):
-                    qa_status = result['qa_results'].get('overall_status', 'Unknown')
-                    st.metric("✅ Quality Status", qa_status)
+                st.metric("📁 Session Files", "All Copied")
             
             # Download section
             st.divider()
@@ -593,11 +659,6 @@ class ProductionQBRStreamlitApp:
                         type="primary",
                         use_container_width=True
                     )
-            
-            # Quality assurance results
-            if result.get('qa_results'):
-                with st.expander("🔍 Quality Assurance Results"):
-                    st.json(result['qa_results'])
             
             # Show QBR specification used
             if st.session_state.qbr_spec:
@@ -629,8 +690,9 @@ class ProductionQBRStreamlitApp:
 
 def main():
     """Main entry point for the Streamlit app."""
-    app = ProductionQBRStreamlitApp()
+    app = FileBasedQBRStreamlitApp()
     app.run()
+
 
 if __name__ == "__main__":
     main()
